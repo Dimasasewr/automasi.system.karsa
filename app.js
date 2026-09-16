@@ -4,8 +4,22 @@
 (() => {
   'use strict';
 
-  const SB_URL = String(window.KARSA_SUPABASE_URL || '').trim();
-  const SB_KEY = String(window.KARSA_SUPABASE_ANON_KEY || '').trim();
+  const KARSA_CONFIG = window.KARSA_CONFIG || {};
+
+const SB_URL = String(
+  KARSA_CONFIG.SUPABASE_URL ||
+  window.KARSA_SUPABASE_URL ||
+  ''
+).trim();
+
+const SB_KEY = String(
+  KARSA_CONFIG.SUPABASE_KEY ||
+  window.KARSA_SUPABASE_ANON_KEY ||
+  window.KARSA_SUPABASE_KEY ||
+  ''
+).trim();
+
+const DEMO_MODE = Boolean(KARSA_CONFIG.DEMO_MODE);
   const state = {
     transactions: [], sales: [], purchases: [], ar: [], ap: [], arPayments: [], apPayments: [],
     products: [], hpp: [], journals: [], journalLines: [], accounts: [], cashAccounts: [], profile: null
