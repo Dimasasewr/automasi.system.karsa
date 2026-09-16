@@ -1,350 +1,1989 @@
-/* KARSA Finance System — production-style client layer
-   Supabase Auth + PostgreSQL + double-entry journals + CSV/XLSX export.
-   No public registration: users are created in Supabase Authentication. */
-(() => {
-  'use strict';
+/* =========================================================
+   KARSA FINANCE — FINAL DATABASE FIX / MIGRATION
+   Tujuan:
+   - Menyamakan database dengan app.js terbaru
+   - Tidak menghapus data lama
+   - Menambahkan tabel/kolom yang kurang
+   - Double-entry journal
+   - Kas & Bank
+   - Penjualan / Pembelian
+   - Piutang / Hutang
+   - Produk / Stok / HPP
+   - Audit log
+   - RPC posting transaksi
+   ========================================================= */
 
-  const SB_URL = String(window.KARSA_SUPABASE_URL || '').trim();
-  const SB_KEY = String(window.KARSA_SUPABASE_ANON_KEY || '').trim();
-  const state = {
-    transactions: [], sales: [], purchases: [], ar: [], ap: [], arPayments: [], apPayments: [],
-    products: [], hpp: [], journals: [], journalLines: [], accounts: [], cashAccounts: [], profile: null
-  };
-  let sb = null;
-  let user = null;
-  let toastTimer = null;
+create extension if not exists pgcrypto;
 
-  const $ = id => document.getElementById(id);
-  const num = v => {
-    const n = Number(String(v ?? '').replace(/[^0-9.-]/g, ''));
-    return Number.isFinite(n) ? n : 0;
-  };
-  const money = v => new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(num(v));
-  const dateToday = () => new Date().toISOString().slice(0, 10);
-  const esc = s => String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
-  const slug = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'data';
-  const configured = () => !!(SB_URL && SB_KEY && !/PASTE_/i.test(SB_URL) && !/PASTE_/i.test(SB_KEY));
 
-  function toast(text, ok = true) {
-    const el = $('toast'); if (!el) return;
-    el.textContent = text; el.classList.toggle('error', !ok); el.classList.add('show');
-    clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('show'), 3200);
-  }
-  function authMessage(text, ok = false) {
-    const el = $('authMessage'); if (!el) return;
-    el.textContent = text; el.className = 'auth-message ' + (ok ? 'ok' : 'error');
-  }
-  function setLoader(text) { if ($('loaderStatus')) $('loaderStatus').textContent = text; }
-  function showLoader(on) { $('loader')?.classList.toggle('hidden', !on); }
-  function showAuth() { $('auth')?.classList.remove('hidden'); $('app')?.classList.add('hidden'); }
-  function showApp() { $('auth')?.classList.add('hidden'); $('app')?.classList.remove('hidden'); }
+/* =========================================================
+   1. PROFILES
+   ========================================================= */
 
-  function errorText(error) {
-    if (!error) return 'Terjadi kesalahan.';
-    return error.message || error.details || error.hint || 'Terjadi kesalahan pada Supabase.';
-  }
-  async function query(table, columns = '*', order = 'created_at', ascending = false) {
-    let q = sb.from(table).select(columns);
-    if (order) q = q.order(order, { ascending });
-    const { data, error } = await q;
-    if (error) throw error;
-    return data || [];
-  }
-  async function insert(table, row) {
-    const payload = { ...row };
-    if (user && ['transactions','sales','purchases','ar_payments','ap_payments','products','stock_movements','journal_headers'].includes(table)) payload.created_by = user.id;
-    const { data, error } = await sb.from(table).insert(payload).select().single();
-    if (error) throw error;
-    return data;
-  }
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  full_name text,
+  role text not null default 'finance'
+    check (role in ('owner','director','finance','it')),
+  active boolean not null default true,
+  created_at timestamptz not null default now()
+);
 
-  async function loadAll() {
-    const tasks = [
-      ['transactions','transactions','transaction_date'], ['sales','sales','sale_date'], ['purchases','purchases','purchase_date'],
-      ['accounts_receivable','ar','invoice_date'], ['accounts_payable','ap','invoice_date'], ['ar_payments','arPayments','payment_date'],
-      ['ap_payments','apPayments','payment_date'], ['products','products','created_at'], ['accounts','accounts','code'],
-      ['cash_accounts','cashAccounts','created_at'], ['journal_headers','journals','journal_date'],
-      ['v_product_hpp','hpp','name'], ['product_cost_components','costComponents','created_at'], ['stock_movements','stockMovements','movement_date']
-    ];
-    await Promise.all(tasks.map(async ([table, key, order]) => {
-      try { state[key] = await query(table, '*', order, false); }
-      catch (e) { if (table.startsWith('v_')) state[key] = []; else throw e; }
-    }));
-    try { state.journalLines = await query('journal_lines', '*', 'line_no', true); } catch (e) { state.journalLines = []; }
-    try {
-      const { data, error } = await sb.from('profiles').select('*').eq('id', user.id).maybeSingle();
-      if (error) throw error;
-      state.profile = data;
-    } catch (e) { state.profile = null; }
-    window.KARSA_STATE = state;
-  }
+alter table public.profiles
+  add column if not exists full_name text;
 
-  function account(code) { return state.accounts.find(a => a.code === code); }
-  function accountId(code) { return account(code)?.id || null; }
-  function cashId() { return state.cashAccounts[0]?.id || null; }
-  function ensureAccount(code, label) { const id = accountId(code); if (!id) throw new Error(`Akun ${code} (${label}) belum ada. Jalankan SQL database KARSA terlebih dahulu.`); return id; }
-  function ensureCash() { const id = cashId(); if (!id) throw new Error('Belum ada Kas/Bank. Buat minimal satu rekening di Supabase atau jalankan SQL setup KARSA.'); return id; }
-  function nextNo(prefix, rows, field) {
-    const max = rows.reduce((m, r) => { const x = String(r[field] || '').match(/(\d+)$/); return x ? Math.max(m, Number(x[1])) : m; }, 0);
-    return `${prefix}-${String(max + 1).padStart(5, '0')}`;
-  }
+alter table public.profiles
+  add column if not exists role text default 'finance';
 
-  async function createJournal({ type, date, description, sourceType, sourceId, lines }) {
-    const clean = lines.filter(x => num(x.debit) > 0 || num(x.credit) > 0).map((x, i) => ({ ...x, debit: num(x.debit), credit: num(x.credit), line_no: i + 1 }));
-    const debit = clean.reduce((s, x) => s + x.debit, 0);
-    const credit = clean.reduce((s, x) => s + x.credit, 0);
-    if (!clean.length) throw new Error('Jurnal tidak memiliki baris.');
-    if (Math.abs(debit - credit) > 0.01) throw new Error(`Jurnal tidak balance. Debit ${money(debit)} ≠ Kredit ${money(credit)}.`);
-    for (const line of clean) if (!line.account_id) throw new Error('Ada akun jurnal yang belum tersedia. Jalankan SQL setup.');
-    const header = await insert('journal_headers', {
-      journal_no: nextNo('JRN', state.journals, 'journal_no'), journal_date: date || dateToday(), journal_type: type,
-      source_type: sourceType || null, source_id: sourceId || null, description, status: 'posted'
-    });
-    const { error } = await sb.from('journal_lines').insert(clean.map(x => ({ journal_id: header.id, line_no: x.line_no, account_id: x.account_id, description: x.description || description, debit: x.debit, credit: x.credit })));
-    if (error) throw error;
-    return header;
-  }
+alter table public.profiles
+  add column if not exists active boolean default true;
 
-  async function addCashTransaction(data) {
-    const amount = num(data.cash_in) || num(data.cash_out);
-    const direction = num(data.cash_in) > 0 ? 'in' : 'out';
-    if ((num(data.cash_in) > 0) === (num(data.cash_out) > 0)) throw new Error('Isi salah satu: Uang Masuk atau Uang Keluar.');
-    const { data: row, error } = await sb.rpc('post_cash_transaction', {
-      p_date: data.transaction_date || dateToday(), p_direction: direction, p_category: data.category, p_amount: amount,
-      p_cash_account_id: data.cash_account_id || null, p_description: String(data.description || '').trim(),
-      p_reference: data.reference_no || null, p_pic: data.pic || null
-    });
-    if (error) throw error;
-    return row;
-  }
+alter table public.profiles
+  add column if not exists created_at timestamptz default now();
 
-  function formField(label, name, type = 'text', value = '', extra = '') {
-    return `<div class="field"><label>${esc(label)}<input name="${esc(name)}" type="${type}" value="${esc(value)}" ${extra}></label></div>`;
-  }
-  function selectField(label, name, options, value = '', extra = '') {
-    return `<div class="field"><label>${esc(label)}<select name="${esc(name)}" ${extra}><option value="">Pilih...</option>${options.map(o => `<option value="${esc(o.value)}" ${String(o.value)===String(value)?'selected':''}>${esc(o.label)}</option>`).join('')}</select></label></div>`;
-  }
-  function modal(title, eyebrow, html, onSubmit) {
-    $('modalEyebrow').textContent = eyebrow; $('modalTitle').textContent = title; $('modalForm').innerHTML = html + '<div class="form-actions"><button type="button" class="close-form" id="cancelForm">Batal</button><button class="gold-btn" type="submit">Simpan & Posting</button></div>';
-    $('modal').classList.remove('hidden');
-    $('cancelForm').onclick = closeModal;
-    $('modalForm').onsubmit = async e => { e.preventDefault(); const fd = new FormData(e.currentTarget); try { await onSubmit(fd); closeModal(); await refresh(); toast('Data berhasil disimpan.'); } catch (err) { toast(errorText(err), false); } };
-  }
-  function closeModal() { $('modal')?.classList.add('hidden'); $('modalForm').innerHTML = ''; }
 
-  function cashOptions() { return state.cashAccounts.map(c => ({ value: c.id, label: `${c.name} (${c.account_type === 'bank' ? 'Bank' : 'Kas'})` })); }
-  function transactionModal() {
-    const cash = cashOptions();
-    modal('Tambah transaksi', 'TRANSACTION', `<div class="form-grid">
-      ${formField('Tanggal','transaction_date','date',dateToday(),'required')}
-      ${selectField('Jenis','direction',[{value:'in',label:'Uang Masuk'},{value:'out',label:'Uang Keluar'}],'in','required')}
-      ${selectField('Kategori','category',[{value:'Penjualan',label:'Penjualan'},{value:'Modal',label:'Modal'},{value:'Pelunasan Piutang',label:'Pelunasan Piutang'},{value:'Pendapatan Lain',label:'Pendapatan Lain'},{value:'Pembelian',label:'Pembelian'},{value:'Pengeluaran',label:'Pengeluaran'},{value:'Bayar Hutang',label:'Bayar Hutang'},{value:'Prive',label:'Prive'}],'','required')}
-      ${formField('Nominal','amount','number','','min="0" step="0.01" required')}
-      ${selectField('Kas / Bank','cash_account_id',cash,'',cash.length?'required':'')}
-      ${formField('Referensi','reference_no','text','','placeholder="Invoice / bukti"')}
-      ${formField('PIC','pic','text','','placeholder="Nama PIC"')}
-      <div class="field full"><label>Keterangan<textarea name="description" rows="3" required></textarea></label></div>
-    </div>`, async fd => {
-      const direction = fd.get('direction'); const amount = num(fd.get('amount'));
-      if (amount <= 0) throw new Error('Nominal harus lebih dari 0.');
-      await addCashTransaction({ transaction_date: fd.get('transaction_date'), category: fd.get('category'), description: fd.get('description'), cash_account_id: fd.get('cash_account_id'), cash_in: direction==='in'?amount:0, cash_out: direction==='out'?amount:0, reference_no: fd.get('reference_no'), pic: fd.get('pic'), source_type:'manual' });
-    });
-  }
+/* =========================================================
+   2. ACCOUNTS / COA
+   ========================================================= */
 
-  function saleModal() {
-    modal('Tambah penjualan', 'SALES', `<div class="form-grid">
-      ${formField('Tanggal','sale_date','date',dateToday(),'required')}
-      ${formField('Pelanggan','customer_name','text','','placeholder="Nama pelanggan"')}
-      ${formField('Total Penjualan','total','number','','min="0" step="0.01" required')}
-      ${formField('Dibayar','paid','number','0','min="0" step="0.01" required')}
-      ${formField('Jatuh Tempo','due_date','date')}
-      ${selectField('Kas / Bank','cash_account_id',cashOptions())}
-    </div>`, async fd => {
-      const total=num(fd.get('total')), paid=num(fd.get('paid'));
-      if(total<=0)throw new Error('Total penjualan harus lebih dari 0.');
-      if(paid<0||paid>total)throw new Error('Nominal dibayar tidak valid.');
-      const { error } = await sb.rpc('post_sale', {
-        p_date: fd.get('sale_date') || dateToday(), p_customer: fd.get('customer_name') || null, p_total: total, p_paid: paid,
-        p_due: fd.get('due_date') || null, p_cash_account_id: fd.get('cash_account_id') || null
-      });
-      if(error)throw error;
-    });
-  }
+create table if not exists public.accounts (
+  id uuid primary key default gen_random_uuid(),
+  code text unique not null,
+  name text not null,
+  account_type text not null
+    check (account_type in
+      ('asset','liability','equity','revenue','expense','cogs')),
+  normal_balance text not null
+    check (normal_balance in ('debit','credit')),
+  parent_id uuid references public.accounts(id),
+  active boolean not null default true,
+  created_at timestamptz not null default now()
+);
 
-  function purchaseModal() {
-    modal('Tambah pembelian', 'PURCHASES', `<div class="form-grid">
-      ${formField('Tanggal','purchase_date','date',dateToday(),'required')}
-      ${formField('Supplier','supplier_name','text','','placeholder="Nama supplier"')}
-      ${formField('Total Pembelian','total','number','','min="0" step="0.01" required')}
-      ${formField('Dibayar','paid','number','0','min="0" step="0.01" required')}
-      ${formField('Jatuh Tempo','due_date','date')}
-      ${selectField('Kas / Bank','cash_account_id',cashOptions())}
-    </div>`, async fd => {
-      const total=num(fd.get('total')), paid=num(fd.get('paid'));
-      if(total<=0)throw new Error('Total pembelian harus lebih dari 0.');
-      if(paid<0||paid>total)throw new Error('Nominal dibayar tidak valid.');
-      const { error } = await sb.rpc('post_purchase', {
-        p_date: fd.get('purchase_date') || dateToday(), p_supplier: fd.get('supplier_name') || null, p_total: total, p_paid: paid,
-        p_due: fd.get('due_date') || null, p_cash_account_id: fd.get('cash_account_id') || null
-      });
-      if(error)throw error;
-    });
-  }
+insert into public.accounts
+(code,name,account_type,normal_balance)
+values
+('1100','Kas','asset','debit'),
+('1200','Bank','asset','debit'),
+('1300','Piutang Usaha','asset','debit'),
+('1400','Persediaan','asset','debit'),
+('2100','Hutang Usaha','liability','credit'),
+('3100','Modal Pemilik','equity','credit'),
+('3200','Prive / Penarikan Pemilik','equity','debit'),
+('4100','Penjualan','revenue','credit'),
+('4200','Pendapatan Lain','revenue','credit'),
+('5100','HPP','cogs','debit'),
+('6100','Beban Operasional','expense','debit'),
+('6200','Beban Administrasi','expense','debit'),
+('6300','Beban Lain','expense','debit')
+on conflict(code) do nothing;
 
-  function productModal() {
-    modal('Tambah produk & HPP', 'PRODUCT / HPP', `<div class="form-grid">
-      ${formField('SKU','sku','text','','required')}${formField('Nama Produk','name','text','','required')}
-      ${formField('Ukuran','size','text','','placeholder="S / M / L / XL"')}${formField('Jenis Kain','fabric_type','text')}
-      ${formField('Harga Jual','selling_price','number','0','min="0" step="0.01" required')}${formField('Stok Awal','stock_qty','number','0','min="0" step="0.001"')}
-      ${formField('Batas Reorder','reorder_level','number','0','min="0" step="0.001"')}
-      <div class="field full"><label>Komponen HPP <span class="field-help">format: nama|kelompok|qty|harga satuan, satu per baris</span><textarea name="components" rows="8" placeholder="Kain Utama|bahan|1|45000\nSatin 1|bahan|0.2|10000\nResleting|aksesoris|1|3000\nSticker|packaging|1|500\nPaper Bag|packaging|1|2500\nThanks Card|packaging|1|1000\nPlastik Zip Lock|packaging|1|700\nHandtag|aksesoris|1|1000\nTali Rami|aksesoris|1|500\nOngkos Produksi|produksi|1|15000"></textarea></label></div>
-    </div>`, async fd => {
-      const row=await insert('products',{sku:fd.get('sku').trim(),name:fd.get('name').trim(),size:fd.get('size')||null,fabric_type:fd.get('fabric_type')||null,selling_price:num(fd.get('selling_price')),stock_qty:num(fd.get('stock_qty')),reorder_level:num(fd.get('reorder_level')),active:true});
-      const lines=String(fd.get('components')||'').split('\n').map(x=>x.trim()).filter(Boolean);
-      const allowed=new Set(['bahan','produksi','packaging','aksesoris']);
-      for(const line of lines){const [name,group='bahan',qty='1',cost='0']=line.split('|').map(x=>x.trim()); if(!name)continue; const g=allowed.has(group.toLowerCase())?group.toLowerCase():'bahan'; await insert('product_cost_components',{product_id:row.id,component_group:g,component_name:name,unit:'pcs',qty:num(qty),unit_cost:num(cost)});}
-      if(num(fd.get('stock_qty'))>0) await insert('stock_movements',{movement_no:nextNo('STK',state.stockMovements,'movement_no'),movement_date:dateToday(),product_id:row.id,movement_type:'in',qty:num(fd.get('stock_qty')),unit_cost:0,source_type:'opening',note:'Stok awal'});
-    });
-  }
 
-  function renderTable(target, headers, rows, empty='Belum ada data.') {
-    const el=$(target); if(!el)return;
-    if(!rows.length){el.innerHTML=`<div class="empty">${esc(empty)}</div>`;return;}
-    el.innerHTML=`<table><thead><tr>${headers.map(h=>`<th>${esc(h.label)}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${headers.map(h=>`<td>${h.html?r=>h.html(r):''}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
-  }
-  // Safe table helper (separate from renderTable to keep cell callbacks readable).
-  function table(target, columns, rows, empty='Belum ada data.') {
-    const el=$(target); if(!el)return;
-    if(!rows.length){el.innerHTML=`<div class="empty">${esc(empty)}</div>`;return;}
-    el.innerHTML=`<table><thead><tr>${columns.map(c=>`<th>${esc(c.label)}</th>`).join('')}</tr></thead><tbody>${rows.map(row=>`<tr>${columns.map(c=>`<td>${c.render?c.render(row):esc(row[c.key])}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
-  }
+/* =========================================================
+   3. CASH ACCOUNTS
+   ========================================================= */
 
-  function renderDashboard() {
-    const t=state.transactions.filter(x=>x.status==='posted'); const inSum=t.reduce((s,x)=>s+num(x.cash_in),0), outSum=t.reduce((s,x)=>s+num(x.cash_out),0);
-    const ar=state.ar.reduce((s,x)=>s+Math.max(0,num(x.amount)-num(x.paid)),0), ap=state.ap.reduce((s,x)=>s+Math.max(0,num(x.amount)-num(x.paid)),0), bal=state.cashAccounts.reduce((s,x)=>s+num(x.opening_balance),0)+inSum-outSum;
-    ['sBalance','heroBalance'].forEach(id=>$(id)&&( $(id).textContent=money(bal) )); if($('sIn'))$('sIn').textContent=money(inSum);if($('sOut'))$('sOut').textContent=money(outSum);if($('sAR'))$('sAR').textContent=money(ar);if($('sAP'))$('sAP').textContent=money(ap);
-    table('recent',[{label:'Tanggal',render:r=>esc(r.transaction_date)},{label:'Keterangan',render:r=>esc(r.description)},{label:'Masuk',render:r=>`<span class="money-in">${money(r.cash_in)}</span>`},{label:'Keluar',render:r=>`<span class="money-out">${money(r.cash_out)}</span>`}],t.slice(0,8));
-    $('controlList').innerHTML=[
-      `<div class="attention-item"><div class="bar"></div><div><strong>${state.journals.length} jurnal tercatat</strong><small>Jurnal tersimpan di database Supabase.</small></div></div>`,
-      `<div class="attention-item"><div class="bar"></div><div><strong>${state.products.length} produk aktif</strong><small>HPP dihitung dari komponen produk.</small></div></div>`,
-      `<div class="attention-item"><div class="bar ${ar>0?'red':''}"></div><div><strong>${money(ar)} piutang tersisa</strong><small>Periksa jatuh tempo pada menu Piutang.</small></div></div>`,
-      `<div class="attention-item"><div class="bar ${ap>0?'red':''}"></div><div><strong>${money(ap)} hutang tersisa</strong><small>Periksa kewajiban pada menu Hutang.</small></div></div>`
-    ].join('');
-  }
-  function renderCash(){
-    const totalIn=state.transactions.reduce((s,x)=>s+num(x.cash_in),0), totalOut=state.transactions.reduce((s,x)=>s+num(x.cash_out),0), opening=state.cashAccounts.reduce((s,x)=>s+num(x.opening_balance),0);
-    $('cashCards').innerHTML=`<div class="stat-card"><span>Saldo Awal</span><strong>${money(opening)}</strong></div><div class="stat-card"><span>Masuk</span><strong>${money(totalIn)}</strong></div><div class="stat-card"><span>Keluar</span><strong>${money(totalOut)}</strong></div><div class="stat-card"><span>Saldo</span><strong>${money(opening+totalIn-totalOut)}</strong></div>`;
-    table('cashTable',[{label:'Tanggal',render:r=>esc(r.transaction_date)},{label:'Rekening',render:r=>esc(state.cashAccounts.find(c=>c.id===r.cash_account_id)?.name||'-')},{label:'Keterangan',render:r=>esc(r.description)},{label:'Masuk',render:r=>`<span class="money-in">${money(r.cash_in)}</span>`},{label:'Keluar',render:r=>`<span class="money-out">${money(r.cash_out)}</span>`}],state.transactions);
-  }
-  function renderTransactions(){table('trxTable',[{label:'ID',render:r=>`<span class="badge">${esc(r.transaction_no)}</span>`},{label:'Tanggal',render:r=>esc(r.transaction_date)},{label:'Kategori',render:r=>esc(r.category)},{label:'Keterangan',render:r=>esc(r.description)},{label:'Masuk',render:r=>`<span class="money-in">${money(r.cash_in)}</span>`},{label:'Keluar',render:r=>`<span class="money-out">${money(r.cash_out)}</span>`},{label:'Status',render:r=>esc(r.status)}],state.transactions);}
-  function renderSales(){table('salesTable',[{label:'No',render:r=>`<span class="badge">${esc(r.sale_no)}</span>`},{label:'Tanggal',render:r=>esc(r.sale_date)},{label:'Customer',render:r=>esc(r.customer_name||'-')},{label:'Total',render:r=>money(r.total)},{label:'Dibayar',render:r=>money(r.paid)},{label:'Sisa',render:r=>money(num(r.total)-num(r.paid))},{label:'Status',render:r=>esc(r.status)}],state.sales);}
-  function renderPurchases(){table('purchaseTable',[{label:'No',render:r=>`<span class="badge">${esc(r.purchase_no)}</span>`},{label:'Tanggal',render:r=>esc(r.purchase_date)},{label:'Supplier',render:r=>esc(r.supplier_name||'-')},{label:'Total',render:r=>money(r.total)},{label:'Dibayar',render:r=>money(r.paid)},{label:'Sisa',render:r=>money(num(r.total)-num(r.paid))},{label:'Status',render:r=>esc(r.status)}],state.purchases);}
-  function renderAR(){table('arTable',[{label:'Customer',render:r=>esc(r.customer_name)},{label:'Referensi',render:r=>esc(r.reference_no||'-')},{label:'Tanggal',render:r=>esc(r.invoice_date)},{label:'Total',render:r=>money(r.amount)},{label:'Dibayar',render:r=>money(r.paid)},{label:'Sisa',render:r=>money(num(r.amount)-num(r.paid))},{label:'Jatuh Tempo',render:r=>esc(r.due_date||'-')},{label:'Status',render:r=>esc(r.status)}],state.ar);}
-  function renderAP(){table('apTable',[{label:'Supplier',render:r=>esc(r.supplier_name)},{label:'Referensi',render:r=>esc(r.reference_no||'-')},{label:'Tanggal',render:r=>esc(r.invoice_date)},{label:'Total',render:r=>money(r.amount)},{label:'Dibayar',render:r=>money(r.paid)},{label:'Sisa',render:r=>money(num(r.amount)-num(r.paid))},{label:'Jatuh Tempo',render:r=>esc(r.due_date||'-')},{label:'Status',render:r=>esc(r.status)}],state.ap);}
-  function renderStock(){table('stockTable',[{label:'SKU',render:r=>`<span class="badge">${esc(r.sku)}</span>`},{label:'Produk',render:r=>esc(r.name)},{label:'Ukuran',render:r=>esc(r.size||'-')},{label:'Kain',render:r=>esc(r.fabric_type||'-')},{label:'Stok',render:r=>num(r.stock_qty)},{label:'HPP/Unit',render:r=>money(r.hpp_per_unit)},{label:'Harga Jual',render:r=>money(r.selling_price)},{label:'Laba/Unit',render:r=>money(r.estimated_profit)},{label:'Margin',render:r=>`${num(r.margin_percent).toFixed(2)}%`}],state.hpp.length?state.hpp:state.products.map(p=>({...p,hpp_per_unit:0,estimated_profit:num(p.selling_price),margin_percent:100})));}
-  function renderJournal(){
-    const rows=state.journals.map(h=>{const ls=state.journalLines.filter(l=>l.journal_id===h.id);return {...h,lines:ls};});
-    table('journalTable',[{label:'No',render:r=>`<span class="badge">${esc(r.journal_no)}</span>`},{label:'Tanggal',render:r=>esc(r.journal_date)},{label:'Jenis',render:r=>esc(r.journal_type)},{label:'Keterangan',render:r=>esc(r.description)},{label:'Debit',render:r=>money(r.lines.reduce((s,l)=>s+num(l.debit),0))},{label:'Kredit',render:r=>money(r.lines.reduce((s,l)=>s+num(l.credit),0))},{label:'Balance',render:r=>{const d=r.lines.reduce((s,l)=>s+num(l.debit),0),c=r.lines.reduce((s,l)=>s+num(l.credit),0);return Math.abs(d-c)<.01?'<span class="badge ok-badge">BALANCE</span>':'<span class="badge danger-badge">SELISIH</span>';}}],rows);
-  }
-  function renderReports(){
-    const revenue=state.journals.flatMap(h=>state.journalLines.filter(l=>l.journal_id===h.id).map(l=>({...l,h}))).reduce((s,l)=>{const a=state.accounts.find(x=>x.id===l.account_id);return s+(a?.account_type==='revenue'?num(l.credit)-num(l.debit):0)},0);
-    const cogs=state.journals.flatMap(h=>state.journalLines.filter(l=>l.journal_id===h.id).map(l=>({...l,h}))).reduce((s,l)=>{const a=state.accounts.find(x=>x.id===l.account_id);return s+(a?.account_type==='cogs'?num(l.debit)-num(l.credit):0)},0);
-    const expense=state.journals.flatMap(h=>state.journalLines.filter(l=>l.journal_id===h.id).map(l=>({...l,h}))).reduce((s,l)=>{const a=state.accounts.find(x=>x.id===l.account_id);return s+(a?.account_type==='expense'?num(l.debit)-num(l.credit):0)},0);
-    const gross=revenue-cogs, net=gross-expense;
-    $('reportCards').innerHTML=`<div class="stat-card"><span>Pendapatan</span><strong>${money(revenue)}</strong></div><div class="stat-card"><span>HPP</span><strong>${money(cogs)}</strong></div><div class="stat-card"><span>Laba Kotor</span><strong>${money(gross)}</strong></div><div class="stat-card"><span>Beban</span><strong>${money(expense)}</strong></div><div class="stat-card"><span>Laba Bersih</span><strong>${money(net)}</strong></div>`;
-    table('reportTable',[{label:'Laporan',render:r=>esc(r.name)},{label:'Nilai',render:r=>money(r.value)}],[{name:'Penjualan',value:revenue},{name:'HPP',value:cogs},{name:'Laba Kotor',value:gross},{name:'Beban Operasional',value:expense},{name:'Laba Bersih',value:net}]);
-  }
-  function renderAll(){renderDashboard();renderCash();renderTransactions();renderSales();renderPurchases();renderAR();renderAP();renderStock();renderJournal();renderReports();}
+create table if not exists public.cash_accounts (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  account_type text not null
+    check (account_type in ('cash','bank')),
+  account_id uuid references public.accounts(id),
+  opening_balance numeric(18,2) not null default 0,
+  active boolean not null default true,
+  created_at timestamptz not null default now()
+);
 
-  function csvEscape(v){return `"${String(v??'').replace(/"/g,'""')}"`;}
-  function downloadCSV(filename, rows){
-    if(!rows.length){toast('Tidak ada data untuk diexport.',false);return;}
-    const headers=Object.keys(rows[0]); const text=[headers.map(csvEscape).join(','),...rows.map(r=>headers.map(h=>csvEscape(r[h])).join(','))].join('\r\n');
-    const blob=new Blob(['\ufeff'+text],{type:'text/csv;charset=utf-8'}); const a=document.createElement('a'); const url=URL.createObjectURL(blob); a.href=url;a.download=filename;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),500);
-  }
-  function journalExportRows(){return state.journals.flatMap(h=>state.journalLines.filter(l=>l.journal_id===h.id).map(l=>({journal_no:h.journal_no,tanggal:h.journal_date,jenis:h.journal_type,referensi:h.source_type||'',keterangan:h.description,akun:state.accounts.find(a=>a.id===l.account_id)?.code||'',nama_akun:state.accounts.find(a=>a.id===l.account_id)?.name||'',debit:num(l.debit),kredit:num(l.credit),status:h.status})));}
-  function exportData(type){
-    const map={transactions:state.transactions,journal:journalExportRows(),sales:state.sales,purchases:state.purchases,ar:state.ar,ap:state.ap,stock:state.hpp};
-    if(type==='xlsx'){exportWorkbook();return;}
-    if(type==='all'){downloadCSV(`KARSA-Finance-Semua-${dateToday()}.csv`,state.transactions);return;}
-    downloadCSV(`KARSA-Finance-${slug(type)}-${dateToday()}.csv`,map[type]||[]);
-  }
-  function exportWorkbook(){
-    if(!window.XLSX){toast('Library Excel belum termuat. Pastikan koneksi internet tersedia.',false);return;}
-    const wb=XLSX.utils.book_new();
-    const add=(name,rows)=>{const data=rows.length?rows:[{Keterangan:'Tidak ada data'}];XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(data),name.slice(0,31));};
-    add('Petunjuk',[{Item:'KARSA Finance',Keterangan:'Workbook export dari Supabase'},{Item:'Saldo',Keterangan:'Saldo Awal + Uang Masuk - Uang Keluar'},{Item:'HPP',Keterangan:'Qty x Harga Satuan; total produk = SUM komponen'},{Item:'Laba Bersih',Keterangan:'Pendapatan - HPP - Beban'},{Item:'Spreadsheet',Keterangan:'File XLSX dapat dibuka/import ke Google Sheets.'}]);
-    add('Transaksi',state.transactions);add('Penjualan',state.sales);add('Pembelian',state.purchases);add('Piutang',state.ar);add('Hutang',state.ap);add('Produk_HPP',state.hpp);add('Komponen_HPP',state.costComponents);add('Stok',state.stockMovements);add('Jurnal',journalExportRows());add('Akun',state.accounts);add('Kas_Bank',state.cashAccounts);
+alter table public.cash_accounts
+  add column if not exists account_id uuid references public.accounts(id);
 
-    const cashSheet=[['Rekening','Saldo Awal','Uang Masuk','Uang Keluar','Saldo Akhir']];
-    state.cashAccounts.forEach((c,i)=>{
-      const row=i+2, ins=state.transactions.filter(t=>t.cash_account_id===c.id).reduce((s,t)=>s+num(t.cash_in),0), outs=state.transactions.filter(t=>t.cash_account_id===c.id).reduce((s,t)=>s+num(t.cash_out),0);
-      cashSheet.push([c.name,num(c.opening_balance),ins,outs,null]);
-      cashSheet[cashSheet.length-1][4]={f:`B${row}+C${row}-D${row}`};
-    });
-    const wsCash=XLSX.utils.aoa_to_sheet(cashSheet);XLSX.utils.book_append_sheet(wb,wsCash,'Rumus_Kas');
+alter table public.cash_accounts
+  add column if not exists opening_balance numeric(18,2) default 0;
 
-    const hppSheet=[['SKU','Produk','Harga Jual','HPP/Unit','Laba/Unit','Margin %']];
-    state.hpp.forEach((p,i)=>{const r=i+2;hppSheet.push([p.sku,p.name,num(p.selling_price),num(p.hpp_per_unit),null,null]);hppSheet[hppSheet.length-1][4]={f:`C${r}-D${r}`};hppSheet[hppSheet.length-1][5]={f:`IF(C${r}>0,E${r}/C${r},0)`};});
-    XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(hppSheet),'Rumus_HPP');
+alter table public.cash_accounts
+  add column if not exists active boolean default true;
 
-    const journalRows=journalExportRows();
-    const jr=[['Jurnal','Debit','Kredit','Selisih']];
-    journalRows.forEach((x,i)=>{const r=i+2;jr.push([x.journal_no,num(x.debit),num(x.kredit),null]);jr[jr.length-1][3]={f:`B${r}-C${r}`};});
-    XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(jr),'Rumus_Jurnal');
+insert into public.cash_accounts
+(name,account_type,account_id,opening_balance)
+select
+  'Kas Utama',
+  'cash',
+  a.id,
+  0
+from public.accounts a
+where a.code='1100'
+and not exists (
+  select 1
+  from public.cash_accounts
+  where name='Kas Utama'
+);
 
-    const rev=state.journals.flatMap(h=>state.journalLines.filter(l=>l.journal_id===h.id).map(l=>({...l,h}))).reduce((s,l)=>{const a=state.accounts.find(x=>x.id===l.account_id);return s+(a?.account_type==='revenue'?num(l.credit)-num(l.debit):0)},0);
-    const cogs=state.journals.flatMap(h=>state.journalLines.filter(l=>l.journal_id===h.id).map(l=>({...l,h}))).reduce((s,l)=>{const a=state.accounts.find(x=>x.id===l.account_id);return s+(a?.account_type==='cogs'?num(l.debit)-num(l.credit):0)},0);
-    const expense=state.journals.flatMap(h=>state.journalLines.filter(l=>l.journal_id===h.id).map(l=>({...l,h}))).reduce((s,l)=>{const a=state.accounts.find(x=>x.id===l.account_id);return s+(a?.account_type==='expense'?num(l.debit)-num(l.credit):0)},0);
-    const lr=[['Komponen','Nilai'],['Pendapatan',null],['HPP',null],['Laba Kotor',null],['Beban',null],['Laba Bersih',null]];
-    lr[1][1]={f:`SUMIF(Jurnal!G:G,"Penjualan",Jurnal!I:I)`};
-    // The exact current journal totals are also stored in a formula-friendly snapshot below.
-    lr[2][1]={f:`SUMIF(Jurnal!G:G,"HPP",Jurnal!H:H)`}; lr[3][1]={f:'B2-B3'}; lr[4][1]={f:`SUMIF(Jurnal!G:G,"Beban*",Jurnal!H:H)`}; lr[5][1]={f:'B4-B5'};
-    // Jurnal uses nama_akun in column G and debit/kredit in H/I; the snapshot is kept alongside for portability.
-    lr.push(['Snapshot Pendapatan',rev],['Snapshot HPP',cogs],['Snapshot Beban',expense]);
-    XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(lr),'Laba_Rugi');
-    XLSX.writeFile(wb,`KARSA-Finance-${dateToday()}.xlsx`);toast('Workbook Excel berhasil dibuat. XLSX dapat dibuka di Microsoft Excel atau Google Sheets.');
-  }
+insert into public.cash_accounts
+(name,account_type,account_id,opening_balance)
+select
+  'Bank Utama',
+  'bank',
+  a.id,
+  0
+from public.accounts a
+where a.code='1200'
+and not exists (
+  select 1
+  from public.cash_accounts
+  where name='Bank Utama'
+);
 
-  function go(page){
-    document.querySelectorAll('.nav-item').forEach(x=>x.classList.toggle('active',x.dataset.page===page));
-    document.querySelectorAll('.view').forEach(x=>x.classList.toggle('active',x.id===page));
-    const title=document.querySelector(`.nav-item[data-page="${CSS.escape(page)}"]`); $('pageTitle').textContent=title?title.textContent.replace(/^./,'').trim():page;
-    window.scrollTo({top:0,behavior:'smooth'});
-  }
-  async function refresh(){await loadAll();renderAll();updateProfile();}
-  function updateProfile(){const name=state.profile?.full_name||user?.email?.split('@')[0]||'Finance';if($('profileName'))$('profileName').textContent=name;if($('profileEmail'))$('profileEmail').textContent=user?.email||'-';if($('avatar'))$('avatar').textContent=name.slice(0,2).toUpperCase();}
+update public.cash_accounts c
+set account_id = a.id
+from public.accounts a
+where c.account_id is null
+and (
+  (c.account_type='cash' and a.code='1100')
+  or
+  (c.account_type='bank' and a.code='1200')
+);
 
-  async function login(){
-    if(!configured()) throw new Error('Supabase belum dikonfigurasi. Isi config.js dengan Project URL dan Publishable/anon public key.');
-    const email=$('loginEmail').value.trim(), password=$('loginPass').value; if(!email||!password)throw new Error('Email dan password wajib diisi.');
-    authMessage('Menghubungkan ke Supabase…',true); const {data,error}=await sb.auth.signInWithPassword({email,password}); if(error)throw error; if(!data.session)throw new Error('Login belum menghasilkan session.');
-  }
-  async function logout(){await sb.auth.signOut();}
 
-  function bind(){
-    $('loginForm')?.addEventListener('submit',async e=>{e.preventDefault();try{await login();}catch(err){authMessage(errorText(err),false);}});
-    $('logout')?.addEventListener('click',async()=>{try{await logout();}catch(e){toast(errorText(e),false);}});
-    $('closeModal')?.addEventListener('click',closeModal); $('modal')?.addEventListener('click',e=>{if(e.target.id==='modal')closeModal();});
-    $('quickBtn')?.addEventListener('click',transactionModal); $('heroAdd')?.addEventListener('click',transactionModal); $('cashAdd')?.addEventListener('click',transactionModal); $('trxAdd')?.addEventListener('click',transactionModal); $('saleAdd')?.addEventListener('click',saleModal); $('purchaseAdd')?.addEventListener('click',purchaseModal); $('productAdd')?.addEventListener('click',productModal);
-    document.querySelectorAll('.nav-item').forEach(b=>b.addEventListener('click',()=>go(b.dataset.page)));
-    document.querySelectorAll('[data-go]').forEach(b=>b.addEventListener('click',()=>go(b.dataset.go)));
-    document.querySelectorAll('[data-export]').forEach(b=>b.addEventListener('click',()=>exportData(b.dataset.export)));
-    setInterval(()=>{if($('clock'))$('clock').textContent=new Intl.DateTimeFormat('id-ID',{dateStyle:'medium',timeStyle:'short'}).format(new Date());},1000);
-  }
+/* =========================================================
+   4. TRANSACTIONS
+   ========================================================= */
 
-  async function init(){
-    bind(); showLoader(true); setLoader('Memeriksa konfigurasi…');
-    if(!configured()){showLoader(false);showAuth();authMessage('Supabase belum dikonfigurasi. Buka config.js lalu isi Project URL dan Publishable/anon public key.');return;}
-    try{
-      sb=window.supabase.createClient(SB_URL,SB_KEY);
-      setLoader('Memeriksa session…'); const {data,error}=await sb.auth.getSession(); if(error)throw error;
-      if(data.session){user=data.session.user;setLoader('Memuat data Finance…');await loadAll();updateProfile();renderAll();showApp();}
-      else {showLoader(false);showAuth();}
-      sb.auth.onAuthStateChange(async (_event,session)=>{user=session?.user||null;if(user){try{setLoader('Memuat data Finance…');showLoader(true);await loadAll();updateProfile();renderAll();showApp();}catch(e){showLoader(false);showAuth();authMessage(errorText(e));}}else{showLoader(false);showAuth();}});
-    }catch(err){console.error(err);showLoader(false);showAuth();authMessage(errorText(err));}
-    showLoader(false);
-  }
-  window.KARSA={state,refresh,login,logout,downloadCSV,exportWorkbook,exportData,money};
-  document.addEventListener('DOMContentLoaded',init);
-})();
+create table if not exists public.transactions (
+  id uuid primary key default gen_random_uuid(),
+  transaction_no text unique not null,
+  transaction_date date not null default current_date,
+  source_type text not null default 'manual',
+  description text not null,
+  category text not null,
+  cash_account_id uuid references public.cash_accounts(id),
+  cash_in numeric(18,2) not null default 0,
+  cash_out numeric(18,2) not null default 0,
+  reference_no text,
+  pic text,
+  status text not null default 'posted'
+    check (status in ('draft','posted','void')),
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.transactions
+  add column if not exists source_type text default 'manual';
+
+alter table public.transactions
+  add column if not exists cash_account_id uuid references public.cash_accounts(id);
+
+alter table public.transactions
+  add column if not exists reference_no text;
+
+alter table public.transactions
+  add column if not exists pic text;
+
+alter table public.transactions
+  add column if not exists created_by uuid references auth.users(id);
+
+alter table public.transactions
+  add column if not exists updated_at timestamptz default now();
+
+update public.transactions
+set source_type='manual'
+where source_type is null;
+
+update public.transactions t
+set cash_account_id = c.id
+from public.cash_accounts c
+where t.cash_account_id is null
+and (
+  (
+    coalesce(t.payment_method,'cash')='cash'
+    and c.name='Kas Utama'
+  )
+  or
+  (
+    coalesce(t.payment_method,'cash')='bank'
+    and c.name='Bank Utama'
+  )
+);
+
+
+/* =========================================================
+   5. SALES
+   ========================================================= */
+
+create table if not exists public.sales (
+  id uuid primary key default gen_random_uuid(),
+  sale_no text unique not null,
+  sale_date date not null default current_date,
+  customer_name text,
+  total numeric(18,2) not null default 0,
+  paid numeric(18,2) not null default 0,
+  due_date date,
+  cash_account_id uuid references public.cash_accounts(id),
+  status text not null default 'paid'
+    check (status in ('unpaid','partial','paid','void')),
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+alter table public.sales
+  add column if not exists sale_date date default current_date;
+
+alter table public.sales
+  add column if not exists due_date date;
+
+alter table public.sales
+  add column if not exists cash_account_id uuid references public.cash_accounts(id);
+
+alter table public.sales
+  add column if not exists created_by uuid references auth.users(id);
+
+alter table public.sales
+  add column if not exists created_at timestamptz default now();
+
+
+/* =========================================================
+   6. PURCHASES
+   ========================================================= */
+
+create table if not exists public.purchases (
+  id uuid primary key default gen_random_uuid(),
+  purchase_no text unique not null,
+  purchase_date date not null default current_date,
+  supplier_name text,
+  total numeric(18,2) not null default 0,
+  paid numeric(18,2) not null default 0,
+  due_date date,
+  cash_account_id uuid references public.cash_accounts(id),
+  status text not null default 'paid'
+    check (status in ('unpaid','partial','paid','void')),
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+alter table public.purchases
+  add column if not exists purchase_date date default current_date;
+
+alter table public.purchases
+  add column if not exists due_date date;
+
+alter table public.purchases
+  add column if not exists cash_account_id uuid references public.cash_accounts(id);
+
+alter table public.purchases
+  add column if not exists created_by uuid references auth.users(id);
+
+alter table public.purchases
+  add column if not exists created_at timestamptz default now();
+
+
+/* =========================================================
+   7. PIUTANG
+   ========================================================= */
+
+create table if not exists public.accounts_receivable (
+  id uuid primary key default gen_random_uuid(),
+  customer_name text not null,
+  reference_no text,
+  invoice_date date not null default current_date,
+  amount numeric(18,2) not null default 0,
+  paid numeric(18,2) not null default 0,
+  due_date date,
+  status text not null default 'unpaid'
+    check (status in ('unpaid','partial','paid')),
+  created_at timestamptz not null default now()
+);
+
+alter table public.accounts_receivable
+  add column if not exists invoice_date date default current_date;
+
+alter table public.accounts_receivable
+  add column if not exists created_at timestamptz default now();
+
+
+/* =========================================================
+   8. PEMBAYARAN PIUTANG
+   ========================================================= */
+
+create table if not exists public.ar_payments (
+  id uuid primary key default gen_random_uuid(),
+  ar_id uuid not null references public.accounts_receivable(id) on delete cascade,
+  payment_date date not null default current_date,
+  amount numeric(18,2) not null,
+  cash_account_id uuid references public.cash_accounts(id),
+  reference_no text,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+
+/* =========================================================
+   9. HUTANG
+   ========================================================= */
+
+create table if not exists public.accounts_payable (
+  id uuid primary key default gen_random_uuid(),
+  supplier_name text not null,
+  reference_no text,
+  invoice_date date not null default current_date,
+  amount numeric(18,2) not null default 0,
+  paid numeric(18,2) not null default 0,
+  due_date date,
+  status text not null default 'unpaid'
+    check (status in ('unpaid','partial','paid')),
+  created_at timestamptz not null default now()
+);
+
+alter table public.accounts_payable
+  add column if not exists invoice_date date default current_date;
+
+alter table public.accounts_payable
+  add column if not exists created_at timestamptz default now();
+
+
+/* =========================================================
+   10. PEMBAYARAN HUTANG
+   ========================================================= */
+
+create table if not exists public.ap_payments (
+  id uuid primary key default gen_random_uuid(),
+  ap_id uuid not null references public.accounts_payable(id) on delete cascade,
+  payment_date date not null default current_date,
+  amount numeric(18,2) not null,
+  cash_account_id uuid references public.cash_accounts(id),
+  reference_no text,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+
+/* =========================================================
+   11. PRODUCTS
+   ========================================================= */
+
+create table if not exists public.products (
+  id uuid primary key default gen_random_uuid(),
+  sku text unique not null,
+  name text not null,
+  size text,
+  fabric_type text,
+  selling_price numeric(18,2) not null default 0,
+  stock_qty numeric(18,3) not null default 0,
+  reorder_level numeric(18,3) not null default 0,
+  active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
+alter table public.products
+  add column if not exists size text;
+
+alter table public.products
+  add column if not exists fabric_type text;
+
+alter table public.products
+  add column if not exists reorder_level numeric(18,3) default 0;
+
+alter table public.products
+  add column if not exists active boolean default true;
+
+alter table public.products
+  add column if not exists created_at timestamptz default now();
+
+alter table public.products
+  alter column stock_qty type numeric(18,3)
+  using stock_qty::numeric;
+
+
+/* =========================================================
+   12. PRODUCT COST / HPP
+   ========================================================= */
+
+create table if not exists public.product_cost_components (
+  id uuid primary key default gen_random_uuid(),
+  product_id uuid not null references public.products(id) on delete cascade,
+  component_group text not null
+    check (component_group in
+      ('bahan','produksi','packaging','aksesoris')),
+  component_name text not null,
+  unit text default 'pcs',
+  qty numeric(18,4) not null default 1,
+  unit_cost numeric(18,2) not null default 0,
+  created_at timestamptz not null default now()
+);
+
+
+/* =========================================================
+   13. MIGRASI HPP DARI STRUKTUR LAMA
+   ========================================================= */
+
+do $$
+begin
+
+  if exists (
+    select 1
+    from information_schema.columns
+    where table_schema='public'
+    and table_name='products'
+    and column_name='fabric_cost'
+  ) then
+
+    insert into public.product_cost_components
+    (product_id,component_group,component_name,unit,qty,unit_cost)
+
+    select
+      p.id,
+      'bahan',
+      'Kain',
+      'pcs',
+      1,
+      coalesce(p.fabric_cost,0)
+
+    from public.products p
+
+    where coalesce(p.fabric_cost,0) > 0
+
+    and not exists (
+      select 1
+      from public.product_cost_components c
+      where c.product_id=p.id
+    );
+
+  end if;
+
+end $$;
+
+
+/* =========================================================
+   14. STOCK MOVEMENTS
+   ========================================================= */
+
+create table if not exists public.stock_movements (
+  id uuid primary key default gen_random_uuid(),
+  movement_no text unique not null,
+  movement_date date not null default current_date,
+  product_id uuid not null references public.products(id),
+  movement_type text not null
+    check (movement_type in ('in','out','adjustment')),
+  qty numeric(18,3) not null,
+  unit_cost numeric(18,2) not null default 0,
+  source_type text,
+  source_id uuid,
+  note text,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+
+/* =========================================================
+   15. JOURNAL HEADERS
+   ========================================================= */
+
+create table if not exists public.journal_headers (
+  id uuid primary key default gen_random_uuid(),
+  journal_no text unique not null,
+  journal_date date not null default current_date,
+  journal_type text not null
+    check (journal_type in
+      ('general','sales','purchase','receipt','payment')),
+  source_type text,
+  source_id uuid,
+  description text not null,
+  status text not null default 'posted'
+    check (status in ('draft','posted','void')),
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+
+/* =========================================================
+   16. JOURNAL LINES
+   ========================================================= */
+
+create table if not exists public.journal_lines (
+  id uuid primary key default gen_random_uuid(),
+  journal_id uuid not null
+    references public.journal_headers(id) on delete cascade,
+  line_no integer not null,
+  account_id uuid not null
+    references public.accounts(id),
+  description text,
+  debit numeric(18,2) not null default 0,
+  credit numeric(18,2) not null default 0,
+  created_at timestamptz not null default now(),
+  check (
+    debit >= 0
+    and credit >= 0
+    and not (debit > 0 and credit > 0)
+  ),
+  unique(journal_id,line_no)
+);
+
+
+/* =========================================================
+   17. AUDIT LOG
+   ========================================================= */
+
+create table if not exists public.audit_logs (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id),
+  action text not null,
+  table_name text,
+  record_id uuid,
+  old_data jsonb,
+  new_data jsonb,
+  created_at timestamptz not null default now()
+);
+
+
+/* =========================================================
+   18. V_PRODUCT_HPP
+   ========================================================= */
+
+create or replace view public.v_product_hpp
+with (security_invoker = true)
+as
+select
+  p.id,
+  p.sku,
+  p.name,
+  p.size,
+  p.fabric_type,
+  p.stock_qty,
+  p.selling_price,
+
+  coalesce(
+    sum(c.qty * c.unit_cost),
+    0
+  )::numeric(18,2) as hpp_per_unit,
+
+  (
+    p.selling_price
+    -
+    coalesce(sum(c.qty * c.unit_cost),0)
+  )::numeric(18,2) as estimated_profit,
+
+  case
+    when p.selling_price > 0 then
+      round(
+        (
+          (
+            p.selling_price
+            -
+            coalesce(sum(c.qty * c.unit_cost),0)
+          )
+          /
+          p.selling_price
+          * 100
+        )::numeric,
+        2
+      )
+    else 0
+  end as margin_percent
+
+from public.products p
+
+left join public.product_cost_components c
+  on c.product_id=p.id
+
+group by
+  p.id,
+  p.sku,
+  p.name,
+  p.size,
+  p.fabric_type,
+  p.stock_qty,
+  p.selling_price;
+
+
+/* =========================================================
+   19. JOURNAL BALANCE VIEW
+   ========================================================= */
+
+create or replace view public.v_journal_balance
+with (security_invoker = true)
+as
+select
+  h.id,
+  h.journal_no,
+  h.journal_date,
+  h.journal_type,
+  h.source_type,
+  h.source_id,
+  h.description,
+  h.status,
+
+  coalesce(sum(l.debit),0)::numeric(18,2)
+    as total_debit,
+
+  coalesce(sum(l.credit),0)::numeric(18,2)
+    as total_credit,
+
+  (
+    coalesce(sum(l.debit),0)
+    -
+    coalesce(sum(l.credit),0)
+  )::numeric(18,2)
+    as difference
+
+from public.journal_headers h
+
+left join public.journal_lines l
+  on l.journal_id=h.id
+
+group by h.id;
+
+
+/* =========================================================
+   20. CASH FLOW VIEW
+   ========================================================= */
+
+create or replace view public.v_cash_flow
+with (security_invoker = true)
+as
+select
+  t.transaction_date,
+  coalesce(c.name,'-') as cash_account,
+  t.transaction_no,
+  t.description,
+  t.source_type,
+  t.cash_in,
+  t.cash_out,
+  (t.cash_in-t.cash_out) as net_cash
+
+from public.transactions t
+
+left join public.cash_accounts c
+  on c.id=t.cash_account_id
+
+where t.status='posted';
+
+
+/* =========================================================
+   21. PROFIT / LOSS VIEW
+   ========================================================= */
+
+create or replace view public.v_profit_loss
+with (security_invoker = true)
+as
+select
+
+  coalesce(
+    sum(
+      case
+        when a.account_type='revenue'
+        then l.credit-l.debit
+        else 0
+      end
+    ),0
+  ) as revenue,
+
+  coalesce(
+    sum(
+      case
+        when a.account_type='cogs'
+        then l.debit-l.credit
+        else 0
+      end
+    ),0
+  ) as cogs,
+
+  coalesce(
+    sum(
+      case
+        when a.account_type='expense'
+        then l.debit-l.credit
+        else 0
+      end
+    ),0
+  ) as expenses
+
+from public.journal_headers h
+
+join public.journal_lines l
+  on l.journal_id=h.id
+
+join public.accounts a
+  on a.id=l.account_id
+
+where h.status='posted';
+
+
+/* =========================================================
+   22. AUTO PROFILE
+   ========================================================= */
+
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path=public
+as $$
+begin
+
+  insert into public.profiles
+  (id,full_name)
+
+  values
+  (
+    new.id,
+    coalesce(
+      new.raw_user_meta_data->>'full_name',
+      new.email
+    )
+  )
+
+  on conflict(id) do nothing;
+
+  return new;
+
+end;
+$$;
+
+drop trigger if exists on_auth_user_created
+on auth.users;
+
+create trigger on_auth_user_created
+after insert on auth.users
+
+for each row
+execute procedure public.handle_new_user();
+
+
+/* =========================================================
+   23. SYNC USER PROFILES YANG SUDAH ADA
+   ========================================================= */
+
+insert into public.profiles
+(id,full_name)
+
+select
+  u.id,
+  coalesce(
+    u.raw_user_meta_data->>'full_name',
+    u.email
+  )
+
+from auth.users u
+
+where not exists (
+  select 1
+  from public.profiles p
+  where p.id=u.id
+);
+
+
+/* =========================================================
+   24. RPC — CASH TRANSACTION
+   ========================================================= */
+
+create or replace function public.post_cash_transaction(
+  p_date date,
+  p_direction text,
+  p_category text,
+  p_amount numeric,
+  p_cash_account_id uuid,
+  p_description text,
+  p_reference text default null,
+  p_pic text default null
+)
+
+returns public.transactions
+
+language plpgsql
+security definer
+set search_path=public
+
+as $$
+
+declare
+  r public.transactions;
+  j public.journal_headers;
+
+  cash_code text;
+  contra_code text;
+  journal_type text;
+
+  n int;
+
+begin
+
+  if auth.uid() is null then
+    raise exception 'AUTH_REQUIRED';
+  end if;
+
+  if p_amount is null or p_amount <= 0 then
+    raise exception 'Nominal harus lebih dari 0';
+  end if;
+
+  if p_direction not in ('in','out') then
+    raise exception 'Jenis transaksi tidak valid';
+  end if;
+
+  if p_cash_account_id is null then
+    raise exception 'Kas/Bank wajib dipilih';
+  end if;
+
+  if not exists (
+    select 1
+    from public.cash_accounts
+    where id=p_cash_account_id
+    and active=true
+  ) then
+    raise exception 'Kas/Bank tidak ditemukan';
+  end if;
+
+
+  select
+    case
+      when account_type='bank'
+      then '1200'
+      else '1100'
+    end
+
+  into cash_code
+
+  from public.cash_accounts
+
+  where id=p_cash_account_id;
+
+
+  if p_direction='in' then
+
+    contra_code :=
+      case p_category
+
+        when 'Penjualan'
+        then '4100'
+
+        when 'Modal'
+        then '3100'
+
+        when 'Pelunasan Piutang'
+        then '1300'
+
+        else '4200'
+
+      end;
+
+    journal_type := 'receipt';
+
+  else
+
+    contra_code :=
+      case p_category
+
+        when 'Pembelian'
+        then '1400'
+
+        when 'Prive'
+        then '3200'
+
+        when 'Bayar Hutang'
+        then '2100'
+
+        else '6100'
+
+      end;
+
+    journal_type := 'payment';
+
+  end if;
+
+
+  if not exists (
+    select 1
+    from public.accounts
+    where code=contra_code
+    and active=true
+  ) then
+    raise exception 'Akun % belum tersedia',contra_code;
+  end if;
+
+
+  select
+    coalesce(
+      max(
+        (regexp_match(transaction_no,'([0-9]+)$'))[1]::int
+      ),
+      0
+    ) + 1
+
+  into n
+
+  from public.transactions;
+
+
+  insert into public.transactions
+  (
+    transaction_no,
+    transaction_date,
+    source_type,
+    description,
+    category,
+    cash_account_id,
+    cash_in,
+    cash_out,
+    reference_no,
+    pic,
+    status,
+    created_by
+  )
+
+  values
+  (
+    'TRX-'||lpad(n::text,5,'0'),
+    coalesce(p_date,current_date),
+    'manual',
+    p_description,
+    p_category,
+    p_cash_account_id,
+
+    case
+      when p_direction='in'
+      then p_amount
+      else 0
+    end,
+
+    case
+      when p_direction='out'
+      then p_amount
+      else 0
+    end,
+
+    p_reference,
+    p_pic,
+    'posted',
+    auth.uid()
+  )
+
+  returning *
+  into r;
+
+
+  select
+    coalesce(
+      max(
+        (regexp_match(journal_no,'([0-9]+)$'))[1]::int
+      ),
+      0
+    ) + 1
+
+  into n
+
+  from public.journal_headers;
+
+
+  insert into public.journal_headers
+  (
+    journal_no,
+    journal_date,
+    journal_type,
+    source_type,
+    source_id,
+    description,
+    status,
+    created_by
+  )
+
+  values
+  (
+    'JRN-'||lpad(n::text,5,'0'),
+    r.transaction_date,
+    journal_type,
+    'transaction',
+    r.id,
+    r.description,
+    'posted',
+    auth.uid()
+  )
+
+  returning *
+  into j;
+
+
+  if p_direction='in' then
+
+    insert into public.journal_lines
+    (
+      journal_id,
+      line_no,
+      account_id,
+      description,
+      debit,
+      credit
+    )
+
+    values
+    (
+      j.id,
+      1,
+      (select id from public.accounts where code=cash_code),
+      r.description,
+      p_amount,
+      0
+    ),
+    (
+      j.id,
+      2,
+      (select id from public.accounts where code=contra_code),
+      r.description,
+      0,
+      p_amount
+    );
+
+  else
+
+    insert into public.journal_lines
+    (
+      journal_id,
+      line_no,
+      account_id,
+      description,
+      debit,
+      credit
+    )
+
+    values
+    (
+      j.id,
+      1,
+      (select id from public.accounts where code=contra_code),
+      r.description,
+      p_amount,
+      0
+    ),
+    (
+      j.id,
+      2,
+      (select id from public.accounts where code=cash_code),
+      r.description,
+      0,
+      p_amount
+    );
+
+  end if;
+
+
+  insert into public.audit_logs
+  (
+    user_id,
+    action,
+    table_name,
+    record_id,
+    new_data
+  )
+
+  values
+  (
+    auth.uid(),
+    'create',
+    'transactions',
+    r.id,
+    to_jsonb(r)
+  );
+
+
+  return r;
+
+end;
+$$;
+
+
+/* =========================================================
+   25. RPC — SALES
+   ========================================================= */
+
+create or replace function public.post_sale(
+  p_date date,
+  p_customer text,
+  p_total numeric,
+  p_paid numeric,
+  p_due date,
+  p_cash_account_id uuid
+)
+
+returns public.sales
+
+language plpgsql
+security definer
+set search_path=public
+
+as $$
+
+declare
+  r public.sales;
+  j public.journal_headers;
+
+  remain numeric;
+  cash_code text;
+
+  n int;
+
+begin
+
+  if auth.uid() is null then
+    raise exception 'AUTH_REQUIRED';
+  end if;
+
+  if p_total is null
+     or p_total <= 0
+     or p_paid < 0
+     or p_paid > p_total then
+
+    raise exception 'Nilai penjualan tidak valid';
+
+  end if;
+
+
+  if p_paid > 0
+     and p_cash_account_id is null then
+
+    raise exception
+      'Kas/Bank wajib dipilih jika ada pembayaran';
+
+  end if;
+
+
+  remain := p_total-p_paid;
+
+
+  if p_cash_account_id is not null then
+
+    select
+      case
+        when account_type='bank'
+        then '1200'
+        else '1100'
+      end
+
+    into cash_code
+
+    from public.cash_accounts
+
+    where id=p_cash_account_id
+    and active=true;
+
+  end if;
+
+
+  select
+    coalesce(
+      max(
+        (regexp_match(sale_no,'([0-9]+)$'))[1]::int
+      ),
+      0
+    ) + 1
+
+  into n
+
+  from public.sales;
+
+
+  insert into public.sales
+  (
+    sale_no,
+    sale_date,
+    customer_name,
+    total,
+    paid,
+    due_date,
+    cash_account_id,
+    status,
+    created_by
+  )
+
+  values
+  (
+    'SALE-'||lpad(n::text,5,'0'),
+    coalesce(p_date,current_date),
+    nullif(p_customer,''),
+    p_total,
+    p_paid,
+    p_due,
+    p_cash_account_id,
+
+    case
+      when remain=0
+      then 'paid'
+      when p_paid=0
+      then 'unpaid'
+      else 'partial'
+    end,
+
+    auth.uid()
+  )
+
+  returning *
+  into r;
+
+
+  select
+    coalesce(
+      max(
+        (regexp_match(journal_no,'([0-9]+)$'))[1]::int
+      ),
+      0
+    ) + 1
+
+  into n
+
+  from public.journal_headers;
+
+
+  insert into public.journal_headers
+  (
+    journal_no,
+    journal_date,
+    journal_type,
+    source_type,
+    source_id,
+    description,
+    status,
+    created_by
+  )
+
+  values
+  (
+    'JRN-'||lpad(n::text,5,'0'),
+    r.sale_date,
+    'sales',
+    'sale',
+    r.id,
+    'Penjualan '||r.sale_no,
+    'posted',
+    auth.uid()
+  )
+
+  returning *
+  into j;
+
+
+  if p_paid > 0 then
+
+    insert into public.journal_lines
+    (
+      journal_id,
+      line_no,
+      account_id,
+      description,
+      debit,
+      credit
+    )
+
+    values
+    (
+      j.id,
+      1,
+      (select id from public.accounts where code=cash_code),
+      'Penjualan '||r.sale_no,
+      p_paid,
+      0
+    );
+
+  end if;
+
+
+  if remain > 0 then
+
+    insert into public.journal_lines
+    (
+      journal_id,
+      line_no,
+      account_id,
+      description,
+      debit,
+      credit
+    )
+
+    values
+    (
+      j.id,
+      case
+        when p_paid>0 then 2
+        else 1
+      end,
+      (select id from public.accounts where code='1300'),
+      'Penjualan '||r.sale_no,
+      remain,
+      0
+    );
+
+  end if;
+
+
+  insert into public.journal_lines
+  (
+    journal_id,
+    line_no,
+    account_id,
+    description,
+    debit,
+    credit
+  )
+
+  values
+  (
+    j.id,
+
+    case
+      when remain>0 then
+        case
+          when p_paid>0 then 3
+          else 2
+        end
+      else 2
+    end,
+
+    (select id from public.accounts where code='4100'),
+
+    'Penjualan '||r.sale_no,
+
+    0,
+    p_total
+  );
+
+
+  if remain>0 then
+
+    insert into public.accounts_receivable
+    (
+      customer_name,
+      reference_no,
+      invoice_date,
+      amount,
+      paid,
+      due_date,
+      status
+    )
+
+    values
+    (
+      coalesce(p_customer,'Pelanggan'),
+      r.sale_no,
+      r.sale_date,
+      p_total,
+      p_paid,
+      p_due,
+
+      case
+        when p_paid=0
+        then 'unpaid'
+        else 'partial'
+      end
+    );
+
+  end if;
+
+
+  insert into public.audit_logs
+  (
+    user_id,
+    action,
+    table_name,
+    record_id,
+    new_data
+  )
+
+  values
+  (
+    auth.uid(),
+    'create',
+    'sales',
+    r.id,
+    to_jsonb(r)
+  );
+
+
+  return r;
+
+end;
+$$;
+
+
+/* =========================================================
+   26. RPC — PURCHASE
+   ========================================================= */
+
+create or replace function public.post_purchase(
+  p_date date,
+  p_supplier text,
+  p_total numeric,
+  p_paid numeric,
+  p_due date,
+  p_cash_account_id uuid
+)
+
+returns public.purchases
+
+language plpgsql
+security definer
+set search_path=public
+
+as $$
+
+declare
+  r public.purchases;
+  j public.journal_headers;
+
+  remain numeric;
+  cash_code text;
+
+  n int;
+  ln int := 1;
+
+begin
+
+  if auth.uid() is null then
+    raise exception 'AUTH_REQUIRED';
+  end if;
+
+
+  if p_total is null
+     or p_total <= 0
+     or p_paid < 0
+     or p_paid > p_total then
+
+    raise exception 'Nilai pembelian tidak valid';
+
+  end if;
+
+
+  if p_paid > 0
+     and p_cash_account_id is null then
+
+    raise exception
+      'Kas/Bank wajib dipilih jika ada pembayaran';
+
+  end if;
+
+
+  remain := p_total-p_paid;
+
+
+  if p_cash_account_id is not null then
+
+    select
+      case
+        when account_type='bank'
+        then '1200'
+        else '1100'
+      end
+
+    into cash_code
+
+    from public.cash_accounts
+
+    where id=p_cash_account_id
+    and active=true;
+
+  end if;
+
+
+  select
+    coalesce(
+      max(
+        (regexp_match(purchase_no,'([0-9]+)$'))[1]::int
+      ),
+      0
+    ) + 1
+
+  into n
+
+  from public.purchases;
+
+
+  insert into public.purchases
+  (
+    purchase_no,
+    purchase_date,
+    supplier_name,
+    total,
+    paid,
+    due_date,
+    cash_account_id,
+    status,
+    created_by
+  )
+
+  values
+  (
+    'PUR-'||lpad(n::text,5,'0'),
+    coalesce(p_date,current_date),
+    nullif(p_supplier,''),
+    p_total,
+    p_paid,
+    p_due,
+    p_cash_account_id,
+
+    case
+      when remain=0
+      then 'paid'
+      when p_paid=0
+      then 'unpaid'
+      else 'partial'
+    end,
+
+    auth.uid()
+  )
+
+  returning *
+  into r;
+
+
+  select
+    coalesce(
+      max(
+        (regexp_match(journal_no,'([0-9]+)$'))[1]::int
+      ),
+      0
+    ) + 1
+
+  into n
+
+  from public.journal_headers;
+
+
+  insert into public.journal_headers
+  (
+    journal_no,
+    journal_date,
+    journal_type,
+    source_type,
+    source_id,
+    description,
+    status,
+    created_by
+  )
+
+  values
+  (
+    'JRN-'||lpad(n::text,5,'0'),
+    r.purchase_date,
+    'purchase',
+    'purchase',
+    r.id,
+    'Pembelian '||r.purchase_no,
+    'posted',
+    auth.uid()
+  )
+
+  returning *
+  into j;
+
+
+  insert into public.journal_lines
+  (
+    journal_id,
+    line_no,
+    account_id,
+    description,
+    debit,
+    credit
+  )
+
+  values
+  (
+    j.id,
+    ln,
+    (select id from public.accounts where code='1400'),
+    'Pembelian '||r.purchase_no,
+    p_total,
+    0
+  );
+
+  ln := ln+1;
+
+
+  if p_paid>0 then
+
+    insert into public.journal_lines
+    (
+      journal_id,
+      line_no,
+      account_id,
+      description,
+      debit,
+      credit
+    )
+
+    values
+    (
+      j.id,
+      ln,
+      (select id from public.accounts where code=cash_code),
+      'Pembelian '||r.purchase_no,
+      0,
+      p_paid
+    );
+
+    ln := ln+1;
+
+  end if;
+
+
+  if remain>0 then
+
+    insert into public.journal_lines
+    (
+      journal_id,
+      line_no,
+      account_id,
+      description,
+      debit,
+      credit
+    )
+
+    values
+    (
+      j.id,
+      ln,
+      (select id from public.accounts where code='2100'),
+      'Pembelian '||r.purchase_no,
+      0,
+      remain
+    );
+
+  end if;
+
+
+  if remain>0 then
+
+    insert into public.accounts_payable
+    (
+      supplier_name,
+      reference_no,
+      invoice_date,
+      amount,
+      paid,
+      due_date,
+      status
+    )
+
+    values
+    (
+      coalesce(p_supplier,'Supplier'),
+      r.purchase_no,
+      r.purchase_date,
+      p_total,
+      p_paid,
+      p_due,
+
+      case
+        when p_paid=0
+        then 'unpaid'
+        else 'partial'
+      end
+    );
+
+  end if;
+
+
+  insert into public.audit_logs
+  (
+    user_id,
+    action,
+    table_name,
+    record_id,
+    new_data
+  )
+
+  values
+  (
+    auth.uid(),
+    'create',
+    'purchases',
+    r.id,
+    to_jsonb(r)
+  );
+
+
+  return r;
+
+end;
+$$;
+
+
+/* =========================================================
+   27. RLS
+   ========================================================= */
+
+do $$
+declare
+  t text;
+begin
+
+  foreach t in array array[
+    'profiles',
+    'accounts',
+    'cash_accounts',
+    'transactions',
+    'sales',
+    'purchases',
+    'accounts_receivable',
+    'accounts_payable',
+    'ar_payments',
+    'ap_payments',
+    'products',
+    'stock_movements',
+    'product_cost_components',
+    'journal_headers',
+    'journal_lines',
+    'audit_logs'
+  ]
+
+  loop
+
+    execute format(
+      'alter table public.%I enable row level security',
+      t
+    );
+
+  end loop;
+
+end $$;
+
+
+/* =========================================================
+   28. READ POLICY
+   ========================================================= */
+
+do $$
+declare
+  t text;
+begin
+
+  foreach t in array array[
+    'profiles',
+    'accounts',
+    'cash_accounts',
+    'transactions',
+    'sales',
+    'purchases',
+    'accounts_receivable',
+    'accounts_payable',
+    'ar_payments',
+    'ap_payments',
+    'products',
+    'stock_movements',
+    'product_cost_components',
+    'journal_headers',
+    'journal_lines',
+    'audit_logs'
+  ]
+
+  loop
+
+    execute format(
+      'drop policy if exists "auth select" on public.%I',
+      t
+    );
+
+    execute format(
+      'create policy "auth select" on public.%I
+       for select
+       to authenticated
+       using (true)',
+      t
+    );
+
+  end loop;
+
+end $$;
+
+
+/* =========================================================
+   29. INSERT POLICY
+   ========================================================= */
+
+do $$
+declare
+  t text;
+begin
+
+  foreach t in array array[
+    'transactions',
+    'sales',
+    'purchases',
+    'accounts_receivable',
+    'accounts_payable',
+    'ar_payments',
+    'ap_payments',
+    'products',
+    'stock_movements',
+    'product_cost_components',
+    'journal_headers',
+    'journal_lines'
+  ]
+
+  loop
+
+    execute format(
+      'drop policy if exists "auth insert" on public.%I',
+      t
+    );
+
+    execute format(
+      'create policy "auth insert" on public.%I
+       for insert
+       to authenticated
+       with check (true)',
+      t
+    );
+
+  end loop;
+
+end $$;
+
+
+/* =========================================================
+   30. PROFILE POLICY
+   ========================================================= */
+
+drop policy if exists "auth insert profile"
+on public.profiles;
+
+create policy "auth insert profile"
+on public.profiles
+
+for insert
+to authenticated
+
+with check (
+  id=auth.uid()
+);
+
+
+drop policy if exists "auth update profile"
+on public.profiles;
+
+create policy "auth update profile"
+on public.profiles
+
+for update
+to authenticated
+
+using (
+  id=auth.uid()
+)
+
+with check (
+  id=auth.uid()
+);
+
+
+/* =========================================================
+   31. RPC PERMISSION
+   ========================================================= */
+
+revoke all on function public.post_cash_transaction(
+  date,
+  text,
+  text,
+  numeric,
+  uuid,
+  text,
+  text,
+  text
+)
+from public;
+
+grant execute on function public.post_cash_transaction(
+  date,
+  text,
+  text,
+  numeric,
+  uuid,
+  text,
+  text,
+  text
+)
+to authenticated;
+
+
+revoke all on function public.post_sale(
+  date,
+  text,
+  numeric,
+  numeric,
+  date,
+  uuid
+)
+from public;
+
+grant execute on function public.post_sale(
+  date,
+  text,
+  numeric,
+  numeric,
+  date,
+  uuid
+)
+to authenticated;
+
+
+revoke all on function public.post_purchase(
+  date,
+  text,
+  numeric,
+  numeric,
+  date,
+  uuid
+)
+from public;
+
+grant execute on function public.post_purchase(
+  date,
+  text,
+  numeric,
+  numeric,
+  date,
+  uuid
+)
+to authenticated;
+
+
+/* =========================================================
+   32. INDEX
+   ========================================================= */
+
+create index if not exists idx_transactions_date
+on public.transactions(transaction_date);
+
+create index if not exists idx_sales_date
+on public.sales(sale_date);
+
+create index if not exists idx_purchases_date
+on public.purchases(purchase_date);
+
+create index if not exists idx_ar_due
+on public.accounts_receivable(due_date);
+
+create index if not exists idx_ap_due
+on public.accounts_payable(due_date);
+
+create index if not exists idx_stock_date
+on public.stock_movements(movement_date);
+
+create index if not exists idx_journal_date
+on public.journal_headers(journal_date);
+
+create index if not exists idx_journal_lines_journal
+on public.journal_lines(journal_id);
+
+create index if not exists idx_hpp_product
+on public.product_cost_components(product_id);
+
+
+/* =========================================================
+   33. RELOAD SUPABASE POSTGREST SCHEMA
+   ========================================================= */
+
+notify pgrst, 'reload schema';
+
+
+/* =========================================================
+   SELESAI
+   ========================================================= */
+
+select
+  'KARSA FINANCE DATABASE READY' as status,
+  now() as executed_at;
