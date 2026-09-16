@@ -5,7 +5,7 @@
 */
 
 window.KARSA_CONFIG = {
-  SUPABASE_URL: "https://bdisklzxbbsybaklkbsv.supabase.co",
-  SUPABASE_KEY: "sb_publishable_v2TXYju6aSvKBMxSQSW2ig_-DaB4ihH",
+  SUPABASE_URL: "https://etwkididzmxfwmzbztfk.supabase.co",
+  SUPABASE_KEY: "sb_publishable_8O6ln1SL006DUoanUbXcOQ_0nQp0LK5",
   DEMO_MODE: false
 };
