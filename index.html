@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0b0b0b">
+<link rel="icon" href="assets/karsa-mark.jpg">
+<title>KARSA Finance — PT Karsa Lifestyle Nusantara</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="loader" class="loader">
+  <div class="loader-logo"><img src="assets/karsa-mark.jpg" alt="KARSA"></div>
+  <div class="loader-word">KARSA</div>
+  <div class="loader-sub">PT KARSA LIFESTYLE NUSANTARA</div>
+  <div class="loader-line"><span></span></div>
+  <div id="loaderStatus" class="loader-status">Menyiapkan Finance System…</div>
+</div>
+
+<div id="auth" class="auth-screen hidden">
+  <div class="auth-panel">
+    <div class="auth-brand"><img src="assets/karsa-mark.jpg" alt="KARSA"><div><b>KARSA</b><span>FINANCE</span></div></div>
+    <div class="auth-copy">
+      <span>PT KARSA LIFESTYLE NUSANTARA</span>
+      <h1>Finance.<br><em>Under Control.</em></h1>
+      <p>Kelola kas, transaksi, penjualan, pembelian, hutang, piutang, stok, HPP, jurnal dan laporan dalam satu workspace.</p>
+    </div>
+    <form id="loginForm" class="auth-form">
+      <label>Email<input id="loginEmail" type="email" placeholder="email perusahaan" autocomplete="username" required></label>
+      <label>Password<input id="loginPass" type="password" placeholder="Masukkan password" autocomplete="current-password" required></label>
+      <button class="gold-btn" type="submit">Masuk ke Finance</button>
+      <div id="authMessage" class="auth-message"></div>
+      <small>Akun dibuat oleh administrator melalui Supabase Authentication. Tidak ada pendaftaran publik.</small>
+    </form>
+  </div>
+</div>
+
+<div id="app" class="app hidden">
+<aside class="sidebar">
+  <div class="side-brand"><img src="assets/karsa-mark.jpg" alt="KARSA"><div><strong>KARSA</strong><span>FINANCE SYSTEM</span></div></div>
+  <div class="profile-mini"><div id="avatar" class="avatar">FN</div><div><strong id="profileName">Finance</strong><span id="profileEmail">-</span></div></div>
+  <nav>
+    <button class="nav-item active" data-page="dashboard"><i>⌂</i>Dashboard</button>
+    <button class="nav-item" data-page="cash"><i>◈</i>Kas & Bank</button>
+    <button class="nav-item" data-page="transactions"><i>▣</i>Transaksi</button>
+    <button class="nav-item" data-page="sales"><i>◇</i>Penjualan</button>
+    <button class="nav-item" data-page="purchases"><i>□</i>Pembelian</button>
+    <button class="nav-item" data-page="receivables"><i>◉</i>Piutang</button>
+    <button class="nav-item" data-page="payables"><i>◍</i>Hutang</button>
+    <button class="nav-item" data-page="stock"><i>△</i>Stok & HPP</button>
+    <button class="nav-item" data-page="journal"><i>≡</i>Jurnal</button>
+    <button class="nav-item" data-page="reports"><i>▥</i>Laporan</button>
+    <button class="nav-item" data-page="export"><i>⇩</i>Export</button>
+  </nav>
+  <div class="side-bottom"><div class="sync-pill"><span></span><div><strong>Supabase Connected</strong><small>Data tersimpan online</small></div></div><button id="logout" class="logout">↪ Keluar</button></div>
+</aside>
+
+<main class="main">
+<header class="topbar"><div><div class="eyebrow">KARSA FINANCE</div><h2 id="pageTitle">Dashboard</h2></div><div class="top-actions"><div id="clock" class="clock"></div><button class="icon-btn" id="quickBtn">+ Transaksi</button></div></header>
+
+<section id="dashboard" class="view active">
+  <div class="hero-banner"><div><div class="eyebrow">FINANCIAL CONTROL</div><h1>Keuangan yang<br><span>lebih tertata.</span></h1><p>Satu tempat untuk mencatat uang masuk, uang keluar, transaksi, stok dan kewajiban perusahaan. Sistem membantu membuat jurnal dan rekap secara otomatis.</p><button class="gold-btn compact" id="heroAdd">Tambah transaksi</button></div><div class="hero-ring"><div><strong id="heroBalance">Rp0</strong><span>Saldo berjalan</span></div></div></div>
+  <div class="stats-grid">
+    <div class="stat-card"><span>Kas & Bank</span><strong id="sBalance">Rp0</strong><small>Saldo berjalan</small></div>
+    <div class="stat-card"><span>Uang Masuk</span><strong id="sIn">Rp0</strong><small>Total transaksi masuk</small></div>
+    <div class="stat-card"><span>Uang Keluar</span><strong id="sOut">Rp0</strong><small>Total transaksi keluar</small></div>
+    <div class="stat-card"><span>Piutang</span><strong id="sAR">Rp0</strong><small>Sisa yang belum dibayar</small></div>
+    <div class="stat-card"><span>Hutang</span><strong id="sAP">Rp0</strong><small>Sisa kewajiban</small></div>
+  </div>
+  <div class="dashboard-grid">
+    <div class="panel"><div class="panel-head"><div><div class="eyebrow">RECENT</div><h3>Transaksi terbaru</h3></div><button class="text-btn" data-go="transactions">Lihat semua →</button></div><div id="recent" class="table-wrap"></div></div>
+    <div class="panel"><div class="panel-head"><div><div class="eyebrow">CONTROL</div><h3>Status keuangan</h3></div></div><div id="controlList" class="attention-list"></div></div>
+  </div>
+</section>
+
+<section id="cash" class="view"><div class="panel"><div class="panel-head"><div><div class="eyebrow">CASH MANAGEMENT</div><h3>Kas & Bank</h3></div><button class="gold-btn compact" id="cashAdd">+ Transaksi</button></div><div id="cashCards" class="stats-grid"></div><div id="cashTable" class="table-wrap"></div></div></section>
+<section id="transactions" class="view"><div class="panel"><div class="panel-head"><div><div class="eyebrow">ALL TRANSACTIONS</div><h3>Semua transaksi</h3></div><button class="gold-btn compact" id="trxAdd">+ Tambah</button></div><div id="trxTable" class="table-wrap"></div></div></section>
+<section id="sales" class="view"><div class="panel"><div class="panel-head"><div><div class="eyebrow">SALES</div><h3>Penjualan</h3></div><button class="gold-btn compact" id="saleAdd">+ Penjualan</button></div><div id="salesTable" class="table-wrap"></div></div></section>
+<section id="purchases" class="view"><div class="panel"><div class="panel-head"><div><div class="eyebrow">PURCHASES</div><h3>Pembelian</h3></div><button class="gold-btn compact" id="purchaseAdd">+ Pembelian</button></div><div id="purchaseTable" class="table-wrap"></div></div></section>
+<section id="receivables" class="view"><div class="panel"><div class="panel-head"><div><div class="eyebrow">RECEIVABLES</div><h3>Piutang</h3></div></div><div id="arTable" class="table-wrap"></div></div></section>
+<section id="payables" class="view"><div class="panel"><div class="panel-head"><div><div class="eyebrow">PAYABLES</div><h3>Hutang</h3></div></div><div id="apTable" class="table-wrap"></div></div></section>
+<section id="stock" class="view"><div class="panel"><div class="panel-head"><div><div class="eyebrow">INVENTORY & COST</div><h3>Stok & HPP</h3></div><button class="gold-btn compact" id="productAdd">+ Produk</button></div><div class="notice">HPP per unit dihitung dari komponen produk. Harga jual − HPP = laba kotor per unit.</div><div id="stockTable" class="table-wrap"></div></div></section>
+<section id="journal" class="view"><div class="panel"><div class="panel-head"><div><div class="eyebrow">DOUBLE ENTRY</div><h3>Jurnal</h3></div></div><div class="notice">Setiap transaksi keuangan yang diposting dibuat sebagai jurnal berpasangan. Debit dan kredit wajib balance.</div><div id="journalTable" class="table-wrap"></div></div></section>
+<section id="reports" class="view"><div class="panel"><div class="eyebrow">REPORTING</div><h3>Ringkasan laporan</h3><div id="reportCards" class="stats-grid"></div><div id="reportTable" class="table-wrap"></div></div></section>
+<section id="export" class="view"><div class="panel"><div class="eyebrow">DATA EXPORT</div><h3>Export data</h3><p class="muted">CSV kompatibel dengan Excel/Google Sheets. XLSX dapat dibuka di Microsoft Excel maupun Google Sheets.</p><div class="export-grid">
+<button class="export-card" data-export="transactions"><b>Transaksi</b><span>CSV</span></button>
+<button class="export-card" data-export="journal"><b>Jurnal Lengkap</b><span>CSV</span></button>
+<button class="export-card" data-export="sales"><b>Penjualan</b><span>CSV</span></button>
+<button class="export-card" data-export="purchases"><b>Pembelian</b><span>CSV</span></button>
+<button class="export-card" data-export="ar"><b>Piutang</b><span>CSV</span></button>
+<button class="export-card" data-export="ap"><b>Hutang</b><span>CSV</span></button>
+<button class="export-card" data-export="stock"><b>Stok & HPP</b><span>CSV</span></button>
+<button class="export-card" data-export="xlsx"><b>Finance Workbook</b><span>EXCEL / SPREADSHEET</span></button>
+</div></div></section>
+</main>
+</div>
+
+<div id="modal" class="modal hidden"><div class="modal-card"><div class="modal-head"><div><div class="eyebrow" id="modalEyebrow">TRANSACTION</div><h3 id="modalTitle">Tambah transaksi</h3></div><button class="close" id="closeModal" type="button">×</button></div><form id="modalForm"></form></div></div>
+<div id="toast" class="toast"></div>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body></html>
